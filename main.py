@@ -11,39 +11,38 @@ import uuid
 import logging
 import pathlib
 import tempfile
-from yt_dlp.utils import DownloadError
 from datetime import datetime
 
 # --- Paths ---
-BASE_DIR      = pathlib.Path(__file__).parent.resolve()
-COOKIES_FILE  = BASE_DIR / "yt.txt"
-# /tmp je sigurna lokacija na većini hostova (i HF Spaces i VPS)
-HLS_ROOT_BASE = pathlib.Path(tempfile.gettempdir())
-HLS_ROOT      = HLS_ROOT_BASE / "hls_segments"
+BASE_DIR = pathlib.Path(__file__).parent.resolve()
+COOKIES_FILE = BASE_DIR / "yt.txt"
+HLS_ROOT = pathlib.Path(tempfile.gettempdir()) / "hls_segments"
 
-# --- Ensure dirs exist ---
+# Ensure HLS base directory exists
 os.makedirs(HLS_ROOT, exist_ok=True)
 
-# --- Concurrency & Logging ---
+# Concurrency & Logging
 download_semaphore = asyncio.Semaphore(30)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- FastAPI setup ---
+# FastAPI setup
 app = FastAPI(title="YouTube Downloader with HLS", version="2.0.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/hls", StaticFiles(directory=str(HLS_ROOT)), name="hls")
 
 def load_cookies_header() -> str:
+    """
+    Read Netscape-format cookies from yt.txt and return as header string.
+    """
     cookies = []
-    if COOKIES_FILE.exists():
-        with open(COOKIES_FILE, 'r') as f:
-            for line in f:
-                if line.startswith('#') or not line.strip():
-                    continue
-                parts = line.strip().split('\t')
-                if len(parts) >= 7:
-                    cookies.append(f"{parts[5]}={parts[6]}")
+    with open(COOKIES_FILE, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+            parts = line.strip().split('\t')
+            if len(parts) >= 7:
+                cookies.append(f"{parts[5]}={parts[6]}")
     return '; '.join(cookies)
 
 @app.middleware("http")
@@ -60,76 +59,80 @@ async def root():
 
 @app.get("/stream/", summary="HLS stream")
 async def stream_video(request: Request, url: str = Query(...), resolution: int = Query(1080)):
-    # 1) Pokušaj ekstrakciju sa kolačićima
-    def extract_info(with_cookies: bool):
-        opts = {
+    await download_semaphore.acquire()
+    try:
+        # 1) Extract available formats using headers + cookies
+        ydl_opts = {
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': str(COOKIES_FILE),
+            'nocheckcertificate': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.youtube.com',
+                'Origin': 'https://www.youtube.com',
+                'X-YouTube-Client-Name': '1',
+                'X-YouTube-Client-Version': '2.20201021.03.00',
+            }
         }
-        if with_cookies and COOKIES_FILE.exists():
-            opts['cookiefile'] = str(COOKIES_FILE)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    try:
-        info = extract_info(True)
-    except DownloadError as e:
-        logger.warning("extract with cookies failed, retrying without cookies: %s", e)
-        try:
-            info = extract_info(False)
-        except DownloadError as e2:
-            logger.error("extract without cookies also failed: %s", e2)
-            raise HTTPException(status_code=500, detail="Could not extract video info")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-    # 2) Nađi baš 1080p mp4 video-only (ili baci 404)
-    try:
+        # Select exact video-only + best audio-only
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none' and f.get('height') == resolution and f.get('ext') == 'mp4'
         )
+        aud_fmt = max(
+            (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
+            key=lambda x: x.get('abr', 0)
+        )
+
+        # Prepare session directory under temp
+t        session_id = uuid.uuid4().hex
+        sess_dir = HLS_ROOT / session_id
+        os.makedirs(sess_dir, exist_ok=True)
+
+        # Build ffmpeg headers for segmenting
+        cookie_header = load_cookies_header()
+        hdr = ['-headers',
+               f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+               f"Referer: https://www.youtube.com\r\n"
+               f"Origin: https://www.youtube.com\r\n"
+               f"Cookie: {cookie_header}\r\n"]
+        cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            *hdr, '-i', vid_fmt['url'],
+            *hdr, '-i', aud_fmt['url'],
+            '-c:v', 'copy', '-c:a', 'copy',
+            '-f', 'hls',
+            '-hls_time', '4',
+            '-hls_list_size', '0',
+            '-hls_flags', 'delete_segments+append_list',
+            '-hls_segment_filename', str(sess_dir / 'seg_%03d.ts'),
+            str(sess_dir / 'index.m3u8')
+        ]
+        proc = subprocess.Popen(cmd, cwd=str(sess_dir))
+
+        # Wait for playlist creation
+        playlist_path = sess_dir / 'index.m3u8'
+        for _ in range(20):
+            if playlist_path.exists():
+                break
+            await asyncio.sleep(0.5)
+        else:
+            proc.kill()
+            raise HTTPException(status_code=500, detail="HLS playlist generation failed")
+
+        # Redirect client to the HLS playlist URL
+        playlist_url = request.url_for('hls', path=f"{session_id}/index.m3u8")
+        return RedirectResponse(playlist_url)
+
     except StopIteration:
-        raise HTTPException(status_code=404, detail=f"No {resolution}p video stream available")
-
-    # 3) Nađi najbolji audio-only tok
-    aud_fmt = max(
-        (f for f in info['formats']
-         if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
-        key=lambda x: x.get('abr', 0)
-    )
-
-    # 4) Priprema HLS sesije
-    session_id = uuid.uuid4().hex
-    sess_dir = HLS_ROOT / session_id
-    os.makedirs(sess_dir, exist_ok=True)
-
-    # 5) Buildujemo ffmpeg komandu
-    cookie_header = load_cookies_header()
-    hdr = []
-    if cookie_header:
-        hdr = ['-headers', f"User-Agent: Mozilla/5.0\r\nCookie: {cookie_header}\r\n"]
-    cmd = [
-        'ffmpeg', '-hide_banner', '-loglevel', 'error',
-        *hdr, '-i', vid_fmt['url'],
-        *hdr, '-i', aud_fmt['url'],
-        '-c:v', 'copy', '-c:a', 'copy',
-        '-f', 'hls',
-        '-hls_time', '4',
-        '-hls_list_size', '0',
-        '-hls_flags', 'delete_segments+append_list',
-        '-hls_segment_filename', str(sess_dir / 'seg_%03d.ts'),
-        str(sess_dir / 'index.m3u8')
-    ]
-    proc = subprocess.Popen(cmd, cwd=str(sess_dir))
-
-    # 6) Sačekaj playlist (do 10s)
-    playlist = sess_dir / 'index.m3u8'
-    for _ in range(20):
-        if playlist.exists():
-            break
-        await asyncio.sleep(0.5)
-    else:
-        proc.kill()
-        raise HTTPException(status_code=500, detail="HLS playlist generation failed")
-
-    # 7) Preusmeri klijenta na playlistu
-    playlist_url = request.url_for('hls', path=f"{session_id}/index.m3u8")
-    return RedirectResponse(playlist_url)
+        raise HTTPException(status_code=404, detail=f"No {resolution}p format available")
+    except Exception as e:
+        logger.error("stream_video error", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        download_semaphore.release()
