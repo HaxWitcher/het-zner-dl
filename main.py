@@ -16,7 +16,7 @@ from datetime import datetime
 # --- Paths ---
 BASE_DIR      = pathlib.Path(__file__).parent.resolve()
 COOKIES_FILE  = BASE_DIR / "yt.txt"
-# Sad ide ispod /tmp, gde Space dozvoljava pisanje
+# pisanje HLS segmenata ide u /tmp, gde Space/VPS dozvoljava
 HLS_ROOT_BASE = pathlib.Path(tempfile.gettempdir())
 HLS_ROOT      = HLS_ROOT_BASE / "hls_segments"
 
@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- FastAPI setup ---
-app = FastAPI(title="YouTube Downloader with HLS", version="2.0.3")
+app = FastAPI(title="YouTube Downloader with HLS", version="2.0.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/hls", StaticFiles(directory=str(HLS_ROOT)), name="hls")
 
@@ -59,32 +59,39 @@ async def root():
 @app.get("/stream/", summary="HLS stream")
 async def stream_video(request: Request, url: str = Query(...), resolution: int = Query(1080)):
     try:
-        # 1) Extract formats
+        # 1) Extraktuj informaciju o tokovima, forsira se web player i geo‑bypass
         ydl_opts = {
             'quiet': True,
-            'cookiefile': str(COOKIES_FILE),
             'no_warnings': True,
+            'cookiefile': str(COOKIES_FILE),
+            'geo_bypass': True,
+            'extractor_args': {
+                'youtube': {
+                    # NAJVAŽNIJE: prisili web player umesto tv/ios/android
+                    'player_client': 'web',
+                }
+            }
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # 2) Select exact video-only 1080p mp4
+        # 2) Pronađi tačno 1080p MP4 video‑only
         vid_fmt = next(
             f for f in info['formats']
             if f.get('vcodec') != 'none' and f.get('height') == resolution and f.get('ext') == 'mp4'
         )
-        # 3) Select best audio-only
+        # 3) Pronađi najbolji audio‑only tok
         aud_fmt = max(
             (f for f in info['formats'] if f.get('vcodec') == 'none' and f.get('acodec') != 'none'),
             key=lambda x: x.get('abr', 0)
         )
 
-        # 4) Prepare HLS session dir under /tmp
+        # 4) Pripremi direktorijum za HLS segmente
         session_id = uuid.uuid4().hex
         sess_dir = HLS_ROOT / session_id
         os.makedirs(sess_dir, exist_ok=True)
 
-        # 5) Build ffmpeg command with UA + Cookie headers
+        # 5) Podesi header‑e za Cookie + UA
         cookie_header = load_cookies_header()
         hdr = ['-headers', f"User-Agent: Mozilla/5.0\r\nCookie: {cookie_header}\r\n"]
         cmd = [
@@ -101,22 +108,22 @@ async def stream_video(request: Request, url: str = Query(...), resolution: int 
         ]
         proc = subprocess.Popen(cmd, cwd=str(sess_dir))
 
-        # 6) Wait for playlist (up to 10s)
-        playlist_path = sess_dir / 'index.m3u8'
+        # 6) Sačekaj da playlist bude gotova
+        playlist = sess_dir / 'index.m3u8'
         for _ in range(20):
-            if playlist_path.exists():
+            if playlist.exists():
                 break
             await asyncio.sleep(0.5)
         else:
             proc.kill()
             raise HTTPException(status_code=500, detail="HLS playlist generation failed")
 
-        # 7) Redirect to the generated playlist
-        playlist_url = request.url_for('hls', path=f"{session_id}/index.m3u8")
-        return RedirectResponse(playlist_url)
+        # 7) Preusmerenje klijenta na playlistu
+        url_pl = request.url_for('hls', path=f"{session_id}/index.m3u8")
+        return RedirectResponse(url_pl)
 
     except StopIteration:
-        raise HTTPException(status_code=404, detail=f"No {resolution}p video stream available")
+        raise HTTPException(status_code=404, detail=f"Nema dostupnog {resolution}p video toka.")
     except Exception as e:
         logger.error("stream_video error", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
